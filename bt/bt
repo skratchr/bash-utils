@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+#
+# bt - A lightweight test runner for bash scripts, inspired by `go test`.
+#
+# Usage:
+#   bt [--debug] <path>    Run all tests found under <path>.
+#   bt [--debug] ./...     Run all tests under the current directory tree.
+#   bt [--debug] <path>/... Run all tests under <path> and its subtree.
+#   bt --help              Show this message and exit.
+#
+# The ./... form mirrors `go test ./...`: the trailing /... means
+# "this directory and all subdirectories recursively".
+#
+# Convention:
+#   For each library file  <path>/foo.sh       create <path>/test_foo.sh.
+#   For each function      foo::bar or _bar    define  test_bar  in the test file.
+#
+# In test functions use the report_failed hook to record assertion failures:
+#   [[ "${got}" == "${want}" ]] || ${report_failed} "got=${got} want=${want}"
+#
+# Requires: bash >= 3.2 (compatible with macOS system bash)
+
+set -euo pipefail
+
+# Temp directory for log files; removed on exit via the EXIT trap below.
+# Note: readonly must come *after* assignment. Declaring readonly first makes
+# the variable readonly with an empty value; the subsequent assignment then
+# fails under set -e, leaving TMPDIR_RUN empty.
+TMPDIR_RUN="$(mktemp -d)"
+readonly TMPDIR_RUN
+
+# Enable verbose warnings about missing tests and libraries.
+DEBUG='false'
+
+# Functions present in the shell before the library under test is sourced.
+# Used by _parse_new_functions to detect what the library added.
+declare -a FUNCTIONS=()
+
+# Library functions that have no matching test_* counterpart.
+declare -a MISSING_TESTS=()
+
+# report_failed hook
+#
+# Must be a string eval'd at the call site so that ${BASH_SOURCE} and
+# ${LINENO} resolve in the caller's frame rather than inside a helper
+# function. This is the only eval in this script; it is intentional.
+#
+# Usage inside a test function:
+#   [[ "${x}" == "y" ]] || ${report_failed} "x=${x}, expected y"
+# shellcheck disable=SC2016
+declare -rx report_failed='eval _report_failed "${BASH_SOURCE[0]}:${LINENO}"'
+
+#######################################
+# Remove the temporary run directory on exit.
+# Globals:
+#   TMPDIR_RUN
+# Arguments:
+#   None
+#######################################
+_cleanup() {
+  rm -rf "${TMPDIR_RUN}"
+}
+trap '_cleanup' EXIT
+
+#######################################
+# Append a warning line to the run-scoped warning log.
+# Globals:
+#   TMPDIR_RUN
+# Arguments:
+#   Message string (variadic).
+# Outputs:
+#   Appends to ${TMPDIR_RUN}/warning.log.
+#######################################
+_warn() {
+  printf 'warning: %s\n' "$*" >>"${TMPDIR_RUN}/warning.log"
+}
+
+#######################################
+# Print PASS or FAIL for a numeric exit code.
+# Arguments:
+#   1 - Exit code (integer). 0 means pass; anything else means fail.
+# Outputs:
+#   Writes label to stdout.
+#######################################
+_result_label() {
+  local -r rc="${1}"
+  if ((rc == 0)); then
+    printf 'PASS'
+  else
+    printf 'FAIL'
+  fi
+}
+
+#######################################
+# Record a test assertion failure and exit the current subshell.
+# Called exclusively via the report_failed hook, never directly.
+# Globals:
+#   None
+# Arguments:
+#   1 - Source location string (file:lineno).
+#   * - Optional human-readable reason for the failure.
+# Outputs:
+#   Writes failure detail to stdout.
+# Returns:
+#   Exits the surrounding subshell with status 1.
+#######################################
+_report_failed() {
+  local -r location="${1}"
+  shift
+  local -r message="${*:-}"
+
+  printf '\tfailed at: %s\n' "${location}"
+  if [[ -n "${message}" ]]; then
+    printf '\treason:    %s\n' "${message}"
+  fi
+  printf '\n'
+
+  # Exit the test subshell rather than setting a global so the result
+  # propagates correctly regardless of the caller's set -e state.
+  exit 1
+}
+
+#######################################
+# Emit names of functions added to the shell after sourcing the library.
+# Filters out internals of bt itself and enforces the lib:: naming rule.
+# Globals:
+#   FUNCTIONS
+# Arguments:
+#   1 - Library base name (e.g. "utils" for utils.sh).
+# Outputs:
+#   Writes one function name per line to stdout.
+#######################################
+_parse_new_functions() {
+  local -r lib="${1}"
+  local fname
+  local known
+  local already_known
+
+  while IFS= read -r fname; do
+    already_known='false'
+    for known in "${FUNCTIONS[@]+"${FUNCTIONS[@]}"}"; do
+      if [[ "${known}" == "${fname}" ]]; then
+        already_known='true'
+        break
+      fi
+    done
+    [[ "${already_known}" == 'true' ]] && continue
+
+    # Namespaced functions (foo::bar) must belong to this library.
+    if [[ "${fname}" == *'::'* && "${fname%::*}" != "${lib}" ]]; then
+      continue
+    fi
+
+    printf '%s\n' "${fname}"
+  done < <(declare -F | awk '{ print $3 }')
+}
+
+#######################################
+# Derive the bare name used in test_* from a library function name.
+# Strips a lib:: namespace prefix or a leading underscore.
+# Arguments:
+#   1 - Library base name (e.g. "utils").
+#   2 - Function name (e.g. "utils::parse" or "_parse").
+# Outputs:
+#   Writes the bare name (e.g. "parse") to stdout.
+#######################################
+_derive_test_name() {
+  local -r lib="${1}"
+  local -r func="${2}"
+  local bare
+
+  if [[ "${func}" == *'::'* ]]; then
+    bare="${func#*::}"
+  elif [[ "${func}" == _* ]]; then
+    bare="${func#_}"
+  else
+    bare="${func}"
+  fi
+
+  printf '%s' "${bare}"
+}
+
+#######################################
+# Run the test_* function for each supplied library function.
+# Globals:
+#   DEBUG
+#   MISSING_TESTS (appended to)
+#   TMPDIR_RUN
+# Arguments:
+#   1   - Script filename (e.g. "utils.sh").
+#   2.. - Library function names to exercise.
+# Returns:
+#   0 if all tests passed, 1 if any test failed.
+#######################################
+_execute_tests() {
+  local -r script_name="${1}"
+  shift
+  local -r lib_name="${script_name%.*}"
+  local rc=0
+  local func bare start stop test_rc
+
+  printf '\n# %s\n' "${script_name}"
+
+  for func in "$@"; do
+    bare="$(_derive_test_name "${lib_name}" "${func}")"
+
+    if ! declare -f "test_${bare}" >/dev/null 2>&1; then
+      MISSING_TESTS+=("${func}")
+      continue
+    fi
+
+    printf '=== RUN   test_%s\n' "${bare}"
+    test_rc=0
+    start="${SECONDS}"
+
+    # Run each test in its own subshell with set -e so that any failing
+    # assertion (which calls exit 1) is captured cleanly.
+    if ! (
+      set -e
+      "test_${bare}"
+    ) 2>>"${TMPDIR_RUN}/error.log"; then
+      test_rc=1
+      rc=1
+    fi
+
+    stop="${SECONDS}"
+    printf -- '--- %s  test_%s (%ds)\n' \
+      "$(_result_label "${test_rc}")" "${bare}" "$((stop - start))"
+  done
+
+  if [[ "${#MISSING_TESTS[@]}" -gt 0 && "${DEBUG}" == 'true' ]]; then
+    local t
+    for t in "${MISSING_TESTS[@]}"; do
+      _warn "no test found for function: ${t} (library: ${lib_name})"
+    done
+  fi
+
+  return "${rc}"
+}
+
+#######################################
+# Recursively find library/test file pairs and run their tests.
+# Globals:
+#   DEBUG
+#   FUNCTIONS (reset per library pair)
+#   TMPDIR_RUN
+# Arguments:
+#   1 - Absolute path to the directory to search.
+# Returns:
+#   0 if all tests passed, 1 if any failed.
+#######################################
+_run() {
+  local -r dir="${1}"
+  local status=0
+  local f base lib test_file
+  local -a lib_funcs
+
+  for f in "${dir}"/*; do
+    if [[ -d "${f}" ]]; then
+      if ! _run "${f}"; then
+        status=1
+      fi
+      continue
+    fi
+
+    [[ -f "${f}" ]] || continue
+
+    base="${f##*/}"  # e.g. utils.sh
+    lib="${base%.*}" # e.g. utils
+
+    # Skip test files — sourced indirectly via their paired library.
+    # No extension filter: library files may have no extension (correct per
+    # Google style guide for executables). Non-shell files (e.g. README.md)
+    # are harmlessly skipped since no matching test_<name>.sh will exist.
+    [[ "${base}" == test_* ]] && continue
+
+    test_file="${dir}/test_${lib}.sh"
+
+    if [[ ! -f "${test_file}" ]]; then
+      if [[ "${DEBUG}" == 'true' ]]; then
+        _warn "no test file found for library: ${base}"
+      fi
+      continue
+    fi
+
+    # Source the library and test file in a subshell so that any variables
+    # or functions they define cannot pollute the runner's own environment.
+    (
+      set -euo pipefail
+
+      # Snapshot the functions already defined before sourcing the library.
+      FUNCTIONS=()
+      while IFS= read -r fn; do
+        FUNCTIONS+=("${fn}")
+      done < <(declare -F | awk '{ print $3 }')
+
+      # shellcheck disable=SC1090
+      source "${f}"
+
+      lib_funcs=()
+      while IFS= read -r fn; do
+        lib_funcs+=("${fn}")
+      done < <(_parse_new_functions "${lib}")
+
+      # TEST_RESULT=0 is kept for backwards compatibility with test files that
+      # use "return $TEST_RESULT" as their last line. In bt, _report_failed
+      # exits the subshell directly, so TEST_RESULT is never actually set;
+      # this declaration simply prevents -u from erroring on the reference.
+      TEST_RESULT=0
+
+      # Source the test file, passing the library filename as $1 so that
+      # test files can reference it (mirrors the original script's convention).
+      # shellcheck disable=SC1090
+      source "${test_file}" "${base}"
+
+      _execute_tests "${base}" "${lib_funcs[@]+"${lib_funcs[@]}"}" || exit 1
+    ) || status=1
+  done
+
+  return "${status}"
+}
+
+#######################################
+# Print usage information to stdout.
+# Globals:
+#   None
+# Arguments:
+#   None
+# Outputs:
+#   Writes usage text to stdout.
+#######################################
+usage() {
+  cat <<EOF
+Usage: ${0##*/} [--debug] <path>
+       ${0##*/} [--debug] ./...
+       ${0##*/} [--debug] <path>/...
+       ${0##*/} --help
+
+Run bash unit tests found under <path>.
+
+The ./... form mirrors go test ./...: the trailing /... suffix means
+"this directory and all subdirectories recursively". A plain directory
+path also recurses, so bt . and bt ./... are equivalent.
+
+Test discovery:
+  For every <path>/foo.sh a matching <path>/test_foo.sh is expected.
+  For each function foo::bar or _bar in foo.sh, define test_bar
+  in test_foo.sh.
+
+Options:
+  --debug   Emit warnings for missing tests and libraries.
+  --help    Show this message and exit.
+
+Exit status:
+  0   All tests passed.
+  1   One or more tests failed, or an error occurred.
+EOF
+}
+
+main() {
+  local path=''
+
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+    --completion)
+      _script_path="${BASH_SOURCE[0]}"
+      while [[ -L "${_script_path}" ]]; do
+        _script_path="$(readlink "${_script_path}")"
+        if [[ "${_script_path}" != /* ]]; then
+          _script_path="$(dirname "${BASH_SOURCE[0]}")/${_script_path}"
+        fi
+      done
+      read -r SCRIPT_DIR < <(dirname "${_script_path}")
+      readonly SCRIPT_DIR
+      echo "${SCRIPT_DIR}/bt-completion.bash"
+      exit 0
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    --debug)
+      DEBUG='true'
+      shift
+      ;;
+    -*)
+      printf 'error: unknown option: %s\n' "${1}" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      path="${1}"
+      shift
+      ;;
+    esac
+  done
+
+  if [[ -z "${path}" ]]; then
+    printf 'error: no path specified\n' >&2
+    usage >&2
+    exit 1
+  fi
+
+  # Expand the Go-style ./... and <path>/... forms.
+  # The trailing /... (or a bare ...) is a recursive-descent marker, not a
+  # real filesystem path. Strip it to get the root directory, which _run
+  # already traverses recursively.
+  if [[ "${path}" == '...' ]]; then
+    path='.'
+  elif [[ "${path}" == *'/...' ]]; then
+    path="${path%/...}"
+    # A bare ./... with nothing before the slash means current directory.
+    [[ -z "${path}" ]] && path='.'
+  fi
+
+  if [[ ! -d "${path}" ]]; then
+    printf 'error: not a directory: %s\n' "${path}" >&2
+    exit 1
+  fi
+
+  local status=0
+  printf '\n*** Running Tests ***\n'
+  _run "$(realpath "${path}")" || status=1
+
+  if [[ -s "${TMPDIR_RUN}/error.log" ]]; then
+    printf '\n=== stderr from tests ===\n'
+    cat "${TMPDIR_RUN}/error.log"
+  fi
+
+  if [[ -s "${TMPDIR_RUN}/warning.log" ]]; then
+    printf '\n=== warnings ===\n'
+    cat "${TMPDIR_RUN}/warning.log"
+  fi
+
+  printf '\n%s\n' "$(_result_label "${status}")"
+  exit "${status}"
+}
+
+main "$@"

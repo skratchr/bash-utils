@@ -1,0 +1,623 @@
+#!/usr/bin/env bash
+#
+# tms — tmux session manager.
+# Plans, diffs and applies a declarative tmux workspace defined in tms.env.
+
+set -e
+
+if ! awk -v a="$(tmux -V | grep -oE '[0-9]+\.[0-9]+' | head -1)" \
+  'BEGIN { exit (a >= 3.2) ? 0 : 1 }'; then
+  echo "This script requires tmux >= 3.2" >&2
+  exit 1
+fi
+
+_script_path="${BASH_SOURCE[0]}"
+while [[ -L "${_script_path}" ]]; do
+  _script_path="$(readlink "${_script_path}")"
+  if [[ "${_script_path}" != /* ]]; then
+    _script_path="$(dirname "${BASH_SOURCE[0]}")/${_script_path}"
+  fi
+done
+read -r SCRIPT_DIR < <(dirname "${_script_path}")
+readonly SCRIPT_DIR
+
+TMS_ENV_PATH="${TMS_ENV_PATH:-}"
+RESET=false
+DRY_RUN=false
+
+if [[ -z "${TMS_ENV_PATH}" || -f "${TMS_ENV_PATH}" ]]; then
+  if [[ -f "${HOME}/.tms.env" ]]; then
+    TMS_ENV_PATH="${HOME}/.tms.env"
+  else
+    TMS_ENV_PATH="${SCRIPT_DIR}/tms.env"
+  fi
+fi
+readonly TMS_ENV_PATH
+source "${TMS_ENV_PATH}"
+
+declare -A PLAN_PANES # [session:window]   = pane count
+declare -A PLAN_CMDS  # [session:window:N] = command for pane N
+declare -A PLAN_OPTS  # [session:window]   = space-separated "key=value" opts
+declare -A PLAN_URLS  # [session:window]   = remote url (code windows only)
+declare -A PLAN_DIRS  # [session:window]   = local directory (code windows only)
+declare -a PLAN_ORDER # ordered "session:window" keys
+declare -a SESSION_ORDER
+declare -a ACTIONS
+declare -A ACTION_MAP
+
+#######################################
+# Print an error message to STDERR.
+# Arguments:
+#   Message string(s).
+# Outputs:
+#   Writes timestamped error to STDERR.
+#######################################
+err() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*" >&2
+}
+
+###############################################################################
+# Phase 0 — plan builders
+###############################################################################
+
+#######################################
+# Record a session name in SESSION_ORDER (once).
+# Globals:
+#   SESSION_ORDER
+# Arguments:
+#   session — session name.
+#######################################
+plan_session() {
+  local session="${1}"
+  local existing
+  for existing in "${SESSION_ORDER[@]:-}"; do
+    [[ "${existing}" == "${session}" ]] && return
+  done
+  SESSION_ORDER+=("${session}")
+}
+
+#######################################
+# Register a window and its pane commands in the plan.
+# Globals:
+#   PLAN_PANES, PLAN_CMDS, PLAN_ORDER
+# Arguments:
+#   session — tmux session name.
+#   name    — window name.
+#   cmds... — one command string per pane (at least one).
+#######################################
+plan_window() {
+  local session="${1}"
+  shift
+  local name="${1}"
+  shift
+  local -a cmds=("$@")
+  local key="${session}:${name}"
+  local panes
+  ((panes = ${#cmds[@]} > 0 ? ${#cmds[@]} : 1))
+
+  plan_session "${session}"
+  PLAN_PANES["${key}"]="${panes}"
+  PLAN_ORDER+=("${key}")
+
+  local i
+  for ((i = 0; i < ${#cmds[@]}; i++)); do
+    PLAN_CMDS["${key}:${i}"]="${cmds[${i}]}"
+  done
+}
+
+#######################################
+# Append a tmux window option to a planned window.
+# Globals:
+#   PLAN_OPTS
+# Arguments:
+#   session — tmux session name.
+#   name    — window name.
+#   opt     — option in "key=value" form.
+#######################################
+plan_window_opt() {
+  local key="${1}:${2}"
+  PLAN_OPTS["${key}"]="${PLAN_OPTS["${key}"]:-} ${3}"
+}
+
+#######################################
+# Populate the plan from the project_* arrays defined in tms.env.
+# Globals:
+#   project_code, project_dirs, project_urls, project_debg, project_logs
+#   PLAN_URLS, PLAN_DIRS
+#######################################
+plan_project_sessions() {
+  local idx
+  for idx in "${!project_code[@]}"; do
+    local session="${project_code[${idx}]}"
+    local dir="${project_dirs[${idx}]}"
+    local url="${project_urls[${idx}]:-}"
+
+    plan_window "${session}" "code" "cd '${dir}'"
+    PLAN_URLS["${session}:code"]="${url}"
+    PLAN_DIRS["${session}:code"]="${dir}"
+
+    if [[ -n "${project_debg[${idx}]:-}" ]]; then
+      local panes="${project_debg[${idx}]}"
+      local -a cmds=()
+      local p
+      for ((p = 0; p < panes; p++)); do
+        cmds+=("cd '${dir}'")
+      done
+      plan_window "${session}" "debg" "${cmds[@]}"
+    fi
+
+    if [[ -n "${project_logs[${idx}]:-}" ]]; then
+      local cmds_raw="${project_logs[${idx}]}"
+      local -a cmds
+      IFS='|' read -r -a cmds <<<"${cmds_raw}"
+      plan_window "${session}" "logs" "${cmds[@]}"
+    fi
+  done
+}
+
+#######################################
+# Populate the plan from the unified_logs associative array in tms.env.
+# Globals:
+#   unified_logs
+#######################################
+plan_logs_session() {
+  [[ ${#unified_logs[@]} -eq 0 ]] && return
+  local win
+  for win in "${!unified_logs[@]}"; do
+    plan_window "logs" "${win}" "${unified_logs[${win}]}"
+  done
+}
+
+#######################################
+# Populate the plan from the llms / llm_agents arrays in tms.env.
+# Globals:
+#   llms, llm_agents
+#######################################
+plan_llm_session() {
+  local has=$((${#llms[@]} + ${#llm_agents[@]}))
+  [[ ${has} -eq 0 ]] && return
+
+  local win
+  for win in "${!llms[@]}"; do
+    plan_window "llm" "${win}" "${llms[${win}]}"
+    plan_window_opt "llm" "${win}" "remain-on-exit=on"
+  done
+
+  if [[ ${#llm_agents[@]} -gt 0 ]]; then
+    local -a agent_cmds=()
+    local i
+    for ((i = 0; i < ${#llm_agents[@]}; i++)); do
+      agent_cmds+=("${llm_agents[${i}]#*:}")
+    done
+    plan_window "llm" "agents" "${agent_cmds[@]}"
+    plan_window_opt "llm" "agents" "remain-on-exit=on"
+  fi
+}
+
+#######################################
+# Populate the plan from the sshs array in tms.env.
+# Globals:
+#   sshs
+#######################################
+plan_ssh_session() {
+  [[ ${#sshs[@]} -eq 0 ]] && return
+  local host
+  for host in "${sshs[@]}"; do
+    plan_window "ssh" "${host}" "ssh ${host}"
+  done
+}
+
+#######################################
+# Return 0 if the named tmux session exists.
+# Arguments:
+#   session — session name.
+# Returns:
+#   0 if exists, 1 otherwise.
+#######################################
+session_exists() {
+  tmux has-session -t "${1}" 2>/dev/null
+}
+
+#######################################
+# Return 0 if the named window exists inside a session.
+# Arguments:
+#   session — session name.
+#   window  — window name.
+# Returns:
+#   0 if exists, 1 otherwise.
+#######################################
+window_exists() {
+  tmux list-windows -t "${1}" -F "#{window_name}" 2>/dev/null |
+    grep -qx "${2}"
+}
+
+#######################################
+# Compare the plan against live tmux state and populate ACTIONS.
+# Globals:
+#   PLAN_ORDER, PLAN_PANES, RESET
+#   ACTIONS, ACTION_MAP
+#######################################
+diff_plan() {
+  local seen_session=""
+  local key
+
+  for key in "${PLAN_ORDER[@]}"; do
+    local session="${key%%:*}"
+    local window="${key#*:}"
+    local planned_panes="${PLAN_PANES[${key}]}"
+
+    if [[ "${session}" != "${seen_session}" ]]; then
+      seen_session="${session}"
+      if "${RESET}" || ! session_exists "${session}"; then
+        ACTIONS+=("CREATE_SESSION ${session}")
+      else
+        ACTIONS+=("SKIP_SESSION ${session}")
+      fi
+    fi
+
+    if "${RESET}" || ! window_exists "${session}" "${window}"; then
+      ACTIONS+=("CREATE_WINDOW ${key}")
+      ACTION_MAP["${key}"]="CREATE_WINDOW"
+    else
+      local actual_panes
+      actual_panes="$(
+        tmux list-panes -t "${session}:${window}" 2>/dev/null |
+          wc -l |
+          tr -d ' '
+      )"
+      if [[ "${actual_panes}" != "${planned_panes}" ]]; then
+        ACTIONS+=("REBUILD_WINDOW ${key}")
+        ACTION_MAP["${key}"]="REBUILD_WINDOW"
+      else
+        ACTIONS+=("SKIP_WINDOW ${key}")
+        ACTION_MAP["${key}"]="SKIP_WINDOW"
+      fi
+    fi
+  done
+}
+
+#######################################
+# Apply standard options and key-bindings to a new session.
+# Arguments:
+#   session — tmux session name.
+#######################################
+configure_session() {
+  local s="${1}"
+  tmux set-option -t "${s}" display-panes-time 2000
+  tmux set-option -t "${s}" pane-border-status top
+  tmux set-option -t "${s}" pane-border-format " #{pane_title} "
+  tmux set-option -t "${s}" status-left-length 40
+  tmux bind-key -T prefix y set-window-option synchronize-panes \; \
+    display-message "sync-panes: #{?synchronize-panes,ON,OFF}"
+  tmux bind-key -T prefix g display-popup -E -w 80% -h 80% "${SHELL:-bash}"
+}
+
+#######################################
+# Kill a session and any grouped clones of it.
+# Arguments:
+#   session — tmux session name.
+#######################################
+kill_session() {
+  local s="${1}"
+  if ! session_exists "${s}"; then return; fi
+
+  local grp
+  grp="$(tmux display-message -p -t "${s}" "#{session_group}" 2>/dev/null)"
+  if [[ -n "${grp}" ]]; then
+    local clone
+    while read -r clone; do
+      tmux kill-session -t "${clone}" 2>/dev/null || true
+    done < <(
+      tmux list-sessions -F "#{session_name} #{session_group}" 2>/dev/null |
+        awk -v g="${grp}" '$2 == g { print $1 }'
+    )
+  else
+    tmux kill-session -t "${s}" 2>/dev/null || true
+  fi
+}
+
+#######################################
+# Send keys to a tmux pane and press Enter.
+# Arguments:
+#   target — tmux target pane.
+#   keys   — text to send.
+#######################################
+send() {
+  tmux send-keys -t "${1}" "${2}" Enter
+}
+
+#######################################
+# Create or rebuild a planned window and run its pane commands.
+# Globals:
+#   PLAN_PANES, PLAN_CMDS, PLAN_OPTS, PLAN_URLS, PLAN_DIRS
+# Arguments:
+#   action — CREATE_WINDOW or REBUILD_WINDOW.
+#   key    — "session:window" plan key.
+#######################################
+apply_window() {
+  local action="${1}"
+  local key="${2}"
+  local session="${key%%:*}"
+  local window="${key#*:}"
+  local target="${session}:${window}"
+  local panes="${PLAN_PANES[${key}]}"
+
+  local url="${PLAN_URLS[${key}]:-}"
+  local dir="${PLAN_DIRS[${key}]:-}"
+  if [[ -n "${url}" && -n "${dir}" && ! -d "${dir}" ]]; then
+    echo "  cloning ${url}"
+    git clone "${url}" "${dir}"
+  fi
+
+  if [[ "${action}" == "REBUILD_WINDOW" ]]; then
+    tmux new-window -t "${session}" -n "${window}_new"
+    tmux kill-window -t "${target}"
+    tmux rename-window -t "${session}:${window}_new" "${window}"
+  else
+    tmux new-window -t "${session}" -n "${window}"
+  fi
+
+  local opts="${PLAN_OPTS[${key}]:-}"
+  local opt
+  for opt in ${opts}; do
+    local optkey="${opt%%=*}"
+    local optval="${opt#*=}"
+    tmux set-option -w -t "${target}" "${optkey}" "${optval}"
+  done
+
+  if ((panes > 1)); then
+    send "${target}" "${PLAN_CMDS["${key}:0"]}"
+    local p
+    for ((p = 1; p < panes; p++)); do
+      tmux split-window -t "${target}" -v
+      send "${target}" "${PLAN_CMDS["${key}:${p}"]}"
+    done
+    tmux select-layout -t "${target}" even-vertical
+  else
+    send "${target}" "${PLAN_CMDS["${key}:0"]:-}"
+  fi
+
+  tmux select-pane -t "${target}.0"
+}
+
+#######################################
+# Walk ACTIONS and execute each one against tmux.
+# Globals:
+#   ACTIONS, PLAN_PANES
+#######################################
+apply_plan() {
+  local first_window=""
+  local action_line
+
+  for action_line in "${ACTIONS[@]}"; do
+    local action="${action_line%% *}"
+    local target="${action_line#* }"
+
+    case "${action}" in
+    CREATE_SESSION)
+      kill_session "${target}"
+      tmux new-session -d -s "${target}" -n "_init" -x 220 -y 50
+      configure_session "${target}"
+      first_window=""
+      ;;
+    SKIP_SESSION)
+      first_window=""
+      ;;
+    CREATE_WINDOW | REBUILD_WINDOW)
+      local session="${target%%:*}"
+      local window="${target#*:}"
+      apply_window "${action}" "${target}"
+      if [[ -z "${first_window}" ]]; then
+        first_window="${window}"
+        tmux select-window -t "${session}:${first_window}"
+      fi
+      if tmux list-windows -t "${session}" -F "#{window_name}" 2>/dev/null |
+        grep -qx "_init"; then
+        tmux kill-window -t "${session}:_init"
+      fi
+      ;;
+    SKIP_WINDOW)
+      local window="${target#*:}"
+      if [[ -z "${first_window}" ]]; then
+        first_window="${window}"
+      fi
+      ;;
+    esac
+  done
+}
+
+#######################################
+# Print a human-readable summary of the applied plan to STDOUT.
+# Globals:
+#   ACTIONS, PLAN_PANES
+#######################################
+report() {
+  local created_sessions=0
+  local skipped_sessions=0
+  local created_windows=0
+  local rebuilt_windows=0
+  local skipped_windows=0
+  local action_line
+
+  for action_line in "${ACTIONS[@]}"; do
+    local action="${action_line%% *}"
+    local target="${action_line#* }"
+
+    case "${action}" in
+    CREATE_SESSION)
+      echo "[+] ${target}"
+      ((created_sessions++)) || true
+      ;;
+    SKIP_SESSION)
+      echo "[~] ${target}"
+      ((skipped_sessions++)) || true
+      ;;
+    CREATE_WINDOW)
+      local window="${target#*:}"
+      local panes="${PLAN_PANES[${target}]}"
+      echo "  [+] ${window} (${panes} panes)"
+      ((created_windows++)) || true
+      ;;
+    REBUILD_WINDOW)
+      local window="${target#*:}"
+      local panes="${PLAN_PANES[${target}]}"
+      echo "  [*] ${window} (${panes} panes)"
+      ((rebuilt_windows++)) || true
+      ;;
+    SKIP_WINDOW)
+      local window="${target#*:}"
+      local panes="${PLAN_PANES[${target}]}"
+      echo "  [~] ${window} (${panes} panes)"
+      ((skipped_windows++)) || true
+      ;;
+    esac
+  done
+
+  echo ""
+  local total_created=$((created_windows + created_sessions))
+  echo "sessions: $((created_sessions + skipped_sessions))" \
+    "  windows: $((created_windows + rebuilt_windows + skipped_windows))" \
+    "  [+] created: ${total_created}" \
+    "  [*] rebuilt: ${rebuilt_windows}" \
+    "  [~] unchanged: $((skipped_windows + skipped_sessions))"
+}
+
+#######################################
+# Plan, diff, and apply the full workspace layout.
+# Globals:
+#   SECONDS, DRY_RUN
+#######################################
+cmd_init() {
+  local start_time="${SECONDS}"
+
+  plan_project_sessions
+  plan_logs_session
+  plan_llm_session
+  plan_ssh_session
+
+  diff_plan
+
+  if ! "${DRY_RUN}"; then
+    apply_plan
+  fi
+
+  "${DRY_RUN}" && echo "(dry run)" || true
+  report
+  echo "  $((SECONDS - start_time))s"
+}
+
+#######################################
+# Attach (or switch) to a session:window, creating a grouped clone as needed.
+# Globals:
+#   TMUX
+# Arguments:
+#   session — (optional) session name; interactive picker used if omitted.
+#   window  — (optional) window name; interactive picker used if omitted.
+#######################################
+cmd_attach() {
+  local session="${1:-}"
+  local window="${2:-}"
+
+  if [[ -z "${session}" ]]; then
+    if command -v fzf &>/dev/null; then
+      local target
+      read -r target < <(
+        tmux list-windows -a -F "#{session_name}:#{window_name}" |
+          grep -vE '^[^:]*-[0-9]+:' |
+          fzf --height 40% --reverse --prompt "window> "
+      )
+      [[ -z "${target}" ]] && return
+      session="${target%%:*}"
+      window="${target#*:}"
+    else
+      tmux choose-tree -Zs
+      return
+    fi
+  elif [[ -z "${window}" ]]; then
+    if command -v fzf &>/dev/null; then
+      read -r window < <(
+        tmux list-windows -t "${session}" -F "#{window_name}" 2>/dev/null |
+          fzf --height 40% --reverse --prompt "${session}> "
+      )
+      [[ -z "${window}" ]] && return
+    fi
+  fi
+
+  # Derive a per-session environment variable name to track the clone.
+  local clone_var="TX_CLONE_${session//[^a-zA-Z0-9]/_}"
+  local clone
+
+  if [[ -n "${TMUX}" ]]; then
+    clone="$(tmux show-environment "${clone_var}" 2>/dev/null | cut -d= -f2-)"
+  else
+    clone="${!clone_var:-}"
+  fi
+
+  if [[ -z "${clone}" ]] || ! tmux has-session -t "${clone}" 2>/dev/null; then
+    local i=1
+    while tmux has-session -t "${session}-${i}" 2>/dev/null; do
+      ((i++)) || true
+    done
+    clone="${session}-${i}"
+    tmux new-session -d -s "${clone}" -t "${session}"
+    if [[ -n "${TMUX}" ]]; then
+      tmux set-environment "${clone_var}" "${clone}"
+    else
+      export "${clone_var}=${clone}"
+    fi
+  fi
+
+  if [[ -n "${TMUX}" ]]; then
+    exec tmux switch-client -t "${clone}" \
+      ${window:+\; select-window -t "${clone}:${window}"}
+  else
+    exec tmux attach-session -t "${clone}" \
+      ${window:+\; select-window -t "${clone}:${window}"}
+  fi
+}
+
+main() {
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+    --completion)
+      echo "${SCRIPT_DIR}/tms-completion.bash"
+      exit 0
+      ;;
+    --reset)
+      RESET=true
+      set -- init "$@"
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      set -- init "$@"
+      ;;
+    *)
+      # Auto-init if no non-clone sessions exist.
+      local active
+      read -r active < <(
+        tmux list-sessions -F "#{session_name}" 2>/dev/null |
+          grep -vE '^.*-[0-9]+$' ||
+          true
+      )
+      if [[ -z "${active}" && "${1}" != "init" ]]; then
+        set -- init "$@"
+      fi
+      ;;
+    esac
+  done
+
+  case "${1:-}" in
+  init)
+    shift
+    cmd_init "$@"
+    ;;
+  *)
+    cmd_attach "$@"
+    ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
