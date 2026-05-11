@@ -41,14 +41,14 @@ declare -a MISSING_TESTS=()
 
 # report_failed hook
 #
-# Must be a string eval'd at the call site so that ${BASH_SOURCE} and
-# ${LINENO} resolve in the caller's frame rather than inside a helper
-# function. This is the only eval in this script; it is intentional.
+# A readonly string variable that expands to a _report_failed call. Stored as
+# a variable so test files can use ${report_failed} without sourcing bt
+# directly. ${BASH_SOURCE} and ${BASH_LINENO} are resolved inside
+# _report_failed via the call stack rather than at the call site.
 #
 # Usage inside a test function:
 #   [[ "${x}" == "y" ]] || ${report_failed} "x=${x}, expected y"
-# shellcheck disable=SC2016
-declare -rx report_failed='eval _report_failed "${BASH_SOURCE[0]}:${LINENO}"'
+declare -rx report_failed='_report_failed"'
 
 #######################################
 # Remove the temporary run directory on exit.
@@ -94,10 +94,10 @@ _result_label() {
 #######################################
 # Record a test assertion failure and exit the current subshell.
 # Called exclusively via the report_failed hook, never directly.
+# Derives the source location from the call stack via BASH_SOURCE/BASH_LINENO.
 # Globals:
 #   None
 # Arguments:
-#   1 - Source location string (file:lineno).
 #   * - Optional human-readable reason for the failure.
 # Outputs:
 #   Writes failure detail to stdout.
@@ -105,8 +105,7 @@ _result_label() {
 #   Exits the surrounding subshell with status 1.
 #######################################
 _report_failed() {
-  local -r location="${1}"
-  shift
+  local -r location="${BASH_SOURCE[1]}:${BASH_LINENO[0]}"
   local -r message="${*:-}"
 
   printf '\tfailed at: %s\n' "${location}"
