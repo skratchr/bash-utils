@@ -1,5 +1,36 @@
+################################################################################
+# daemon/systemd.bash
+#
+# Service lifecycle helpers for Linux systemd services.
+#
+# Mirrors the interface of daemon/launchd.bash so that a test harness can swap
+# between the two by changing which file it sources.
+#
+# Usage:
+#   source daemon/systemd.bash
+#
+# Environment (consumed on source):
+#   SERVICE_NAME - systemd unit name, without the .service suffix
+#                  e.g. "my-app" resolves to "my-app.service"
+#
+# Exports:
+#   service_name - resolved value of SERVICE_NAME
+#   service_unit - "${service_name}.service"
+#
+# Functions:
+#   service_running   - returns 0 if the unit is currently active
+#   service_load      - starts the unit; no-op if already running
+#   service_unload    - stops the unit and waits for teardown;
+#                       timeout defaults to 30s (pass as second argument to override)
+#
+# Notes:
+#   - Unlike launchd.bash, no sudo is used; run as a user with the appropriate
+#     systemctl privileges, or in a context where sudo is not required.
+#   - log_stderr is expected to be defined by the sourcing harness.
+################################################################################
+
 # This should be the name of the systemd service unit, without the .service suffix.
-readonly service_name="${SERVICE_NAME?:"Missing environment variable SERVICE_NAME"}"
+readonly service_name="${SERVICE_NAME:?"Missing environment variable SERVICE_NAME"}"
 export service_name
 
 readonly service_unit="${service_name}.service"

@@ -1,42 +1,43 @@
 #!/usr/bin/env bash
 ################################################################################
-# This file is a utility script intended to be sourced by test grous that
-# cares about the underlay network. It provides helper functions for
-# network service manipulation and inspection.
+# network/configd.bash
 #
-# Functions:
-#   - scq:
-#       Runs `scutil` with a given command and outputs the result.
+# macOS underlay network inspection and manipulation helpers.
 #
-#   - switch_service_order:
-#       Swaps the order of two network services based on their UUIDs.
+# Intended for test groups that need to inspect or manipulate the host network
+# configuration — for example, to test behaviour when service order changes or
+# when a specific interface is primary.
 #
-#   - device:
-#       Returns the interface name for a given network service UUID.
+# Usage:
+#   source network/configd.bash
 #
-#   - gw:
-#       Returns the default gateway for a given network service UUID.
+# This file should be sourced at the top level of a test suite so that the
+# captured UUIDs remain immutable for the duration of the run. If an IPsec
+# tunnel is detected, or no primary service is found, the file returns early
+# without exporting anything.
 #
-#   - dns:
-#       Returns the DNS servers for a given network service UUID.
+# Exports:
+#   primary_service_uuid   - UUID of the active primary network service
+#   secondary_service_uuid - UUID of a secondary routable service, if one exists
 #
-# Environment:
-#   - primary_service_uuid:
-#       UUID of the primary network service (used for reference).
-#
-#   - secondary_service_uuid:
-#       UUID of the secondary network service (used for reference).
+# Functions (all exported):
+#   scq uuid                   - run scutil "show <key>" and print the result
+#   device uuid                - interface name for a service UUID
+#   gw uuid                    - default gateway for a service UUID
+#   dns uuid                   - semicolon-separated DNS servers for a service UUID
+#   switch_service_order a b   - swap the network service order of UUIDs a and b
 #
 # Notes:
-#   - This script should be sourced at the top level to ensure the state be
-#     immutable.
-#   - It will skip execution if an IPsec tunnel is detected.
-#   - It exports the helper functions and UUIDs for use in test cases.
-#
+#   - All functions read live state from SCDynamicStore via scutil; they reflect
+#     the current system state at call time, not a snapshot.
+#   - switch_service_order calls networksetup with sudo; the caller must have
+#     appropriate privileges.
+#   - The file skips execution silently if an IPsec interface is present, since
+#     reordering services in that state is not meaningful.
 ################################################################################
 
 scq() { echo "show ${1}" | /usr/sbin/scutil; }
-#
+
 # Switches the order between two network services based on their UUID
 switch_service_order() {
 	local new_a a
@@ -79,7 +80,7 @@ switch_service_order() {
 	service_order[new_b]="${b}"
 	service_order[new_a]="${a}"
 	local after="${service_order[*]}"
-	echo "* Changd service order"
+	echo "* Changed service order"
 	echo "from:  ${before}"
 	echo "to:    ${after}"
 	sudo /usr/sbin/networksetup -ordernetworkservices "${service_order[@]}"
@@ -111,7 +112,7 @@ dns() {
 	)
 }
 
-# no point in snapshotting an environment where an ipsec tunnel exists
+# No point snapshotting an environment where an IPsec tunnel exists
 if ifconfig | grep -q ipsec 2>/dev/null; then return; fi
 
 read -r uuid < <(scq "State:/Network/Global/IPv4" | grep "PrimaryService" | awk '{ print $3 }')

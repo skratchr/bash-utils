@@ -1,4 +1,47 @@
 #!/usr/bin/env bash
+################################################################################
+# isolation/docker.bash
+#
+# Provider: Docker container
+#
+# Runs test commands inside a per-run Docker container derived from a pre-built
+# base image. The base image must exist before sourcing this file.
+#
+# Usage:
+#   source isolation/docker.bash
+#
+# Prerequisites:
+#   A base image named "${repo_name}.base" must exist locally. Build it with
+#   your project's build_base_image.sh (or equivalent) before sourcing this.
+#
+# Environment (consumed on source):
+#   repo_name     - used to derive the base image name (${repo_name}.base)
+#                   and per-run container name (${repo_name}.${git_sha})
+#   git_sha       - commit SHA; used to name the container and workspace
+#   git_branch    - branch name; used as a prefix in the workspace directory
+#   project_root  - repository root; workspace created under $project_root/ci/
+#   CI_HOME       - (optional) override workspace root
+#   artifacts_dir - path to the artefacts directory; mounted into the container
+#
+# Exports:
+#   test_workspace  - path to the temporary working directory for this run
+#   test_container  - name of the Docker container for this run
+#
+# Provider interface (all exported):
+#   provider_run     - create and start the container, retrying up to 10 times
+#   provider_exec    - run a bash --login command inside the container;
+#                      writes stderr to $OUTPUT (default /dev/null)
+#   provider_stop    - stop the container with a configurable timeout (default 60s)
+#   provider_remove  - force-stop (1s timeout) and remove the container
+#   provider_cleanup - remove container if it exists, then delete test_workspace
+#
+# Notes:
+#   - If the container already exists from a previous interrupted run it is
+#     reused rather than recreated, and the matching workspace directory is
+#     located by glob rather than created fresh.
+#   - Set OUTPUT to a file path before calling provider_exec to capture stderr
+#     for post-mortem inspection.
+################################################################################
 
 _container_exists() {
   docker inspect "${1:?"Missing argument container_name"}" &>/dev/null

@@ -1,3 +1,39 @@
+################################################################################
+# isolation/bare.bash
+#
+# Provider: bare host
+#
+# Runs test commands directly on the host in a temporary workspace. Useful for
+# fast local iteration where environment isolation is not required.
+#
+# Usage:
+#   source isolation/bare.bash
+#
+# Environment (consumed on source):
+#   repo_name     - repository name; used as a label in workspace paths
+#   git_sha       - commit SHA; combined with git_branch to name the workspace
+#   git_branch    - branch name; used as a prefix in the workspace directory
+#   project_root  - repository root; workspace is created under $project_root/ci/
+#   CI_HOME       - (optional) override workspace root, e.g. in a CI environment
+#
+# Exports:
+#   test_workspace - path to the temporary working directory for this run
+#
+# Provider interface (all exported):
+#   provider_run     - no-op; workspace is created at source time
+#   provider_exec    - executes a bash command on the host; pauses on failure
+#                      in interactive sessions to allow inspection
+#   provider_stop    - no-op
+#   provider_remove  - no-op
+#   provider_cleanup - removes test_workspace
+#
+# Notes:
+#   - provider_exec pauses and waits for a keypress on non-zero exit. This is
+#     intentional for local debugging and should be acceptable in non-CI use.
+#   - The broken export -f aliases (run_environment etc.) are a known issue and
+#     should be fixed to export -f provider_run etc. for consistency.
+################################################################################
+
 provider_run() { :; }
 export -f provider_run
 

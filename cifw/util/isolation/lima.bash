@@ -1,4 +1,48 @@
 #!/usr/bin/env bash
+################################################################################
+# isolation/lima.bash
+#
+# Provider: Lima VM (macOS)
+#
+# Runs test commands inside a per-run Lima virtual machine derived from a
+# pre-existing base instance. The base VM must exist before sourcing this file.
+#
+# Usage:
+#   source isolation/lima.bash
+#
+# Prerequisites:
+#   A Lima instance named "${repo_name}.base" must exist. Create it once with
+#   limactl and configure it as the baseline environment for your tests.
+#
+# Environment (consumed on source):
+#   repo_name     - used to derive the base VM name (${repo_name}.base)
+#                   and per-run VM name (${repo_name}.${git_sha})
+#   git_sha       - commit SHA; used to name the VM and workspace
+#   git_branch    - branch name; used as a prefix in the workspace directory
+#   project_root  - repository root; workspace created under $project_root/ci/
+#   CI_HOME       - (optional) override workspace root
+#   artifacts_dir - path to the artefacts directory; mounted into the VM
+#
+# Exports:
+#   test_workspace - path to the temporary working directory for this run
+#   test_vm        - name of the Lima VM for this run
+#
+# Provider interface (all exported):
+#   provider_run     - create (from base) and start the VM, retrying up to 10
+#                      times; generates a minimal lima YAML on the fly
+#   provider_exec    - run a bash --login command inside the VM via limactl shell;
+#                      writes stderr to $OUTPUT (default /dev/null)
+#   provider_stop    - stop the VM; attempts force-stop on failure
+#   provider_remove  - force-stop (1s) and delete the VM
+#   provider_cleanup - delete VM if it exists, then delete test_workspace
+#
+# Notes:
+#   - The generated Lima template disables containerd (system and user) since
+#     it is not needed for the test environment.
+#   - If the VM already exists from a previous interrupted run it is reused and
+#     the matching workspace directory is located by glob.
+#   - Set OUTPUT to a file path before calling provider_exec to capture stderr.
+################################################################################
 
 #
 # helpers
