@@ -1,8 +1,8 @@
 # bash-utils
 
 An assortment of bash/shell utilities and frameworks aimed to make day-to-day
-development easy accross different projects, and environments. The scripts are
-desgined to be usable with as no external dependencies except the default set
+development easy across different projects, and environments. The scripts are
+designed to be usable with as no external dependencies except the default set
 of unix tools (core-utils for GNU on macOS), and to some degree be reusable, but
 but often see slight modifications are required to better match active projects.
 
@@ -17,9 +17,9 @@ towards OS/Networking/System Integration
 ### Content
 
 ```
-tms           # Plugin free tmux session manaager
+tms           # Plugin free tmux session manager
 bt            # Go test inspired framework for writing bash unit tests
-cifw          # Go test inspired framework for writing ci pipelines/tests
+bccp          # Go test inspired framework for writing ci pipelines/tests
 conv          # Conversion functions commonly used for parsing stuff
 ```
 

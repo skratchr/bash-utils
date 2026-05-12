@@ -25,7 +25,7 @@ EOF
 
 echo "Run test environment"
 provider_exec <<EOF
-echo "Run acceptence test"
+echo "Run acceptance test"
 # ./acceptance-test.sh
 EOF
 provider_remove

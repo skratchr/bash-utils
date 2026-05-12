@@ -48,7 +48,7 @@ declare -a MISSING_TESTS=()
 #
 # Usage inside a test function:
 #   [[ "${x}" == "y" ]] || ${report_failed} "x=${x}, expected y"
-declare -rx report_failed='_report_failed"'
+declare -rx report_failed='_report_failed'
 
 #######################################
 # Remove the temporary run directory on exit.

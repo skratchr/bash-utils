@@ -23,12 +23,12 @@ convert::to_dash_case() {
 }
 
 convert::to_camel_case() {
-  # Couldn't find a good way to handle this conversion without the requirement of
-  # GNU sed/awk so instead it is done manually
   local str="${1}"
   local camelized="" char=""
   local last_found=0
-
+  # Manually loop through characters. This conversion has enough edge-cases that
+  # other solutions like awk requires logic as well, at which point it becomes
+  # both more complex and less maintainable.
   for ((i = 0; i < ${#str}; i++)); do
     [[ "${str:$i:1}" == "-" || ("${str:$i:1}" == "_" && $i -gt 0) ]] && {
       char="$(echo "${str:$((i + 1)):1}" | tr '[:lower:]' '[:upper:]')"
