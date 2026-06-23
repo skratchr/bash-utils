@@ -1,4 +1,4 @@
-# bt
+# bt (bash test)
 
 A lightweight test runner for bash scripts, loosely modelled after `go test`.
 

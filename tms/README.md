@@ -1,4 +1,4 @@
-# tmux-session-mgr
+# tms (tmux-session-manager)
 
 A lightweight session manager for tmux in pure bash.
 
