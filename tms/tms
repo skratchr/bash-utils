@@ -25,7 +25,7 @@ TMS_ENV_PATH="${TMS_ENV_PATH:-}"
 RESET=false
 DRY_RUN=false
 
-if [[ -z "${TMS_ENV_PATH}" || -f "${TMS_ENV_PATH}" ]]; then
+if [[ -z "${TMS_ENV_PATH}" || ! -f "${TMS_ENV_PATH}" ]]; then
   if [[ -f "${HOME}/.tms.env" ]]; then
     TMS_ENV_PATH="${HOME}/.tms.env"
   else
@@ -33,6 +33,10 @@ if [[ -z "${TMS_ENV_PATH}" || -f "${TMS_ENV_PATH}" ]]; then
   fi
 fi
 readonly TMS_ENV_PATH
+if [[ ! -f "${TMS_ENV_PATH}" ]]; then
+  echo "no config found at ${TMS_ENV_PATH}" >&2
+  exit 1
+fi
 source "${TMS_ENV_PATH}"
 
 declare -A PLAN_PANES # [session:window]   = pane count
@@ -525,7 +529,7 @@ cmd_attach() {
         tmux list-windows -a -F "#{session_name}:#{window_name}" |
           grep -vE '^[^:]*-[0-9]+:' |
           fzf --height 40% --reverse --prompt "window> "
-      )
+      ) || true
       [[ -z "${target}" ]] && return
       session="${target%%:*}"
       window="${target#*:}"
@@ -538,7 +542,7 @@ cmd_attach() {
       read -r window < <(
         tmux list-windows -t "${session}" -F "#{window_name}" 2>/dev/null |
           fzf --height 40% --reverse --prompt "${session}> "
-      )
+      ) || true
       [[ -z "${window}" ]] && return
     fi
   fi
@@ -576,7 +580,24 @@ cmd_attach() {
   fi
 }
 
+#######################################
+# Return 0 if at least one non-clone session is live.
+# Clone sessions created by cmd_attach are named "<session>-<N>".
+# Returns:
+#   0 if a real session exists, 1 otherwise.
+#######################################
+has_active_sessions() {
+  local active
+  active="$(
+    tmux list-sessions -F "#{session_name}" 2>/dev/null |
+      grep -vE '^.*-[0-9]+$' ||
+      true
+  )"
+  [[ -n "${active}" ]]
+}
+
 main() {
+  local -a args=()
   local arg
   for arg in "$@"; do
     case "${arg}" in
@@ -586,26 +607,22 @@ main() {
       ;;
     --reset)
       RESET=true
-      set -- init "$@"
       ;;
     --dry-run)
       DRY_RUN=true
-      set -- init "$@"
       ;;
     *)
-      # Auto-init if no non-clone sessions exist.
-      local active
-      read -r active < <(
-        tmux list-sessions -F "#{session_name}" 2>/dev/null |
-          grep -vE '^.*-[0-9]+$' ||
-          true
-      )
-      if [[ -z "${active}" && "${1}" != "init" ]]; then
-        set -- init "$@"
-      fi
+      args+=("${arg}")
       ;;
     esac
   done
+  set -- "${args[@]}"
+
+  # Init when a flag implies it, or when no non-clone sessions exist yet.
+  if [[ "${1:-}" != "init" ]] &&
+    { "${RESET}" || "${DRY_RUN}" || ! has_active_sessions; }; then
+    set -- init "$@"
+  fi
 
   case "${1:-}" in
   init)
