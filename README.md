@@ -2,8 +2,9 @@
 
 An assortment of bash/shell utilities and frameworks aimed to make day-to-day
 development easy across different projects, and environments. The scripts are
-designed to be usable with minimal external dependencies on macOS, they should
-
+designed to be usable with minimal external dependencies and should transfer
+over to linux environments, but some parts were also developed on macOS to
+support workflows targeting apple devices.
 
 While the tools strive to be general usage, they are tailored to fit my personal
 workflow, and the type of projects I'm involved with.
@@ -34,6 +35,6 @@ Required:
 
 Optional:
 
-- bash-completion, for `bt` tab completion
+- bash-completion, for `bt` and `tms` tab completion.
 - fzf, for nicer `tms` interactive selection
 - Docker, Lima, or Tart, only when using the matching `bccp` isolation provider
